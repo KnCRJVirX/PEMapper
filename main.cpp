@@ -8,6 +8,14 @@ int main(int argc, char const *argv[]) {
     std::string processImageFileName;
     DWORD processId = 0;
 
+    if (argc < 3) {
+        PEMapper::Log::Error("Invalid arguments.");
+        std::cout << std::format("Usage: {} -im <ProcessImageFileName> -dll <DllFilePath>", argv[0]) << '\n';
+        std::cout << std::format("Example: {} -im notepad.exe -dll dlltest.dll", argv[0]) << '\n';
+        std::cout << std::endl;
+        return 1;
+    }
+
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "-im")) {
             processImageFileName = argv[++i];
