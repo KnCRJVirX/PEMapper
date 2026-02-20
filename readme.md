@@ -36,4 +36,5 @@
 | `-dll` | 指定DLL文件路径 |
 | `-apc` | 使用APC方式触发DllMain |
 | `-rth` | 创建远程线程触发DllMain |
+| `-nogui` | 目标线程无GUI，触发DllMain的任务将会注入到所有线程 |
 | `-d` | 启用调试模式，日志等级调整为 Debug |

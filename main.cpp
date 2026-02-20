@@ -1,4 +1,4 @@
-#include "PEMapper.hpp"
+﻿#include "PEMapper.hpp"
 
 int main(int argc, char const *argv[]) {
     PEMapper::UnicodeInit();
@@ -7,6 +7,7 @@ int main(int argc, char const *argv[]) {
     std::string dllPath;
     std::string processImageFileName;
     DWORD processId = 0;
+    bool guiOnly = true;
 
     if (argc < 3) {
         PEMapper::Log::Error("Invalid arguments.");
@@ -30,8 +31,13 @@ int main(int argc, char const *argv[]) {
         } else if (!strcmp(argv[i], "-d")) {
             PEMapper::Log::level = PEMapper::Log::Level::Debug;
             PEMapper::Log::Debug("Log level: Debug");
+        } else if (!strcmp(argv[i], "-nogui")) {
+            guiOnly = false;
+            PEMapper::Log::Info("Target process have not GUI, inject all thread.");
         }
     }
+
+    PEMapper::Log::Info(std::format("Inject method: {}", PEMapper::Mapper::InjectMethodToString(method)));
 
     PEMapper::Loader loader(dllPath);
     if (!loader.isInited()) {
@@ -40,12 +46,10 @@ int main(int argc, char const *argv[]) {
     }
     
     PEMapper::Mapper mapper(loader);
-
-    PEMapper::Log::Info(std::format("Inject method: {}", PEMapper::Mapper::InjectMethodToString(method)));
     
     if (processId != 0) {
         // 已指定ProcessID优先使用pid
-        mapper.injectInto(PEMapper::RemoteProcess(processId), method);
+        mapper.injectInto(PEMapper::RemoteProcess(processId), method, guiOnly);
     } else {
         if (dllPath.length() == 0) {
             // 未指定DLL路径
@@ -71,12 +75,11 @@ int main(int argc, char const *argv[]) {
         if (Process32FirstW(hAllProcess, &pe)) {
             do {
                 if (!_wcsicmp(imageFileNameW.c_str(), pe.szExeFile)) {
-                    mapper.injectInto(PEMapper::RemoteProcess(pe.th32ProcessID), method);
+                    mapper.injectInto(PEMapper::RemoteProcess(pe.th32ProcessID), method, guiOnly);
                 }
             } while (Process32NextW(hAllProcess, &pe));
         }
     }
-    
     
     return 0;
 }

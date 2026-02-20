@@ -26,12 +26,6 @@ target_link_libraries(PEMapper PRIVATE
     ntdll
 )
 
-# 编译选项（所有配置共用）
-target_compile_options(PEMapper PRIVATE
-    -Wall
-    -Wextra
-)
-
 # 各构建类型专属编译选项
 target_compile_options(PEMapper PRIVATE
     $<$<CONFIG:Debug>:          -g -O0 -DDEBUG>

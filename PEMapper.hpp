@@ -1,4 +1,4 @@
-#ifndef PEMAPPER_H
+﻿#ifndef PEMAPPER_H
 #define PEMAPPER_H
 
 #include <cstdint>
@@ -7,10 +7,11 @@
 #include <iostream>
 #include <vector>
 #include <format>
-#include <set>
+#include <map>
 #include <algorithm>
 
 #include <Windows.h>
+#include <TlHelp32.h>
 
 #include "Utils.h"
 
@@ -274,7 +275,6 @@ public:
         ReturnBack,     // 通过CreateRemoteThread执行，执行后返回
         JumpBack,       // 通过劫持上下文执行，执行后跳转回原RIP
         LoadDll,        // 通过劫持上下文执行，调用LoadLibraryW，执行后跳转原Rip
-        LoadDllReturn,  // 通过CreateRemoteThread执行，调用LoadLibraryW，执行后返回
     };
 protected:
     std::vector<uint8_t> byteCodes;
@@ -286,6 +286,7 @@ protected:
     size_t offOriginRip    = 0; // JumpBack / LoadDll
     size_t offDllPath      = 0; // 仅 LoadDll：远程进程中宽字符路径的指针
     size_t offLoadLibraryW = 0; // 仅 LoadDll：LoadLibraryW 地址
+    size_t offFlag         = 0; // 仅 JumpBack：call-once 标志地址（远程 DWORD*）
 
     // 往 byteCodes 追加任意字节序列
     void emit(std::initializer_list<uint8_t> bytes) {
@@ -305,27 +306,43 @@ protected:
     }
 public:
     /*
-     * ReturnBack 字节码模板（x86_64，39字节）：
+     * ReturnBack 字节码模板（x86_64）：
      *   sub  rsp, 0x28          ; shadow space + 对齐
+     *   ; call-once CAS 门卫
+     *   xor  eax, eax           ; expected = 0         (33 C0)
+     *   mov  ecx, 1             ; new = 1              (B9 01 00 00 00)
+     *   mov  rdx, <flag_addr>   ; 48 BA [8字节]  ← offFlag
+     *   lock cmpxchg [rdx], ecx ; 原子 CAS             (F0 0F B1 0A)
+     *   jne  skip               ; ZF=0 → 已被抓占，跳过 DllMain (75 1E)
+     *   ; DllMain 调用（仅抢到 CAS 的线程执行，共 30 字节）
      *   mov  rcx, <hInstDll>    ; 48 B9 [8字节]
      *   mov  edx, 1             ; BA 01 00 00 00
      *   xor  r8d, r8d           ; 45 33 C0
      *   mov  rax, <dllMain>     ; 48 B8 [8字节]
      *   call rax                ; FF D0
+     * skip:
      *   add  rsp, 0x28          ; 48 83 C4 28
      *   ret                     ; C3
      *
-     * JumpBack 字节码模板（x86_64，劫持上下文版）：
+     * JumpBack 字节码模板（x86_64，劫持上下文版，含 call-once CAS 门卫）：
      *   push rax/rcx/rdx/r8~r11 ; 保存 7 个易失寄存器（11字节）
      *   push rbp                ; 记录对齐前 RSP 基准
      *   mov  rbp, rsp
      *   and  rsp, -16           ; 强制 16 字节对齐
      *   sub  rsp, 0x20          ; shadow space
+     *   ; call-once CAS 门卫
+     *   xor  eax, eax           ; expected = 0         (33 C0)
+     *   mov  ecx, 1             ; new = 1              (B9 01 00 00 00)
+     *   mov  rdx, <flag_addr>   ; 48 BA [8字节]  ← offFlag
+     *   lock cmpxchg [rdx], ecx ; 原子 CAS             (F0 0F B1 0A)
+     *   jne  skip               ; ZF=0 → 已被抢占，跳过 DllMain (75 1E)
+     *   ; DllMain 调用（仅抢到 CAS 的线程执行）
      *   mov  rcx, <hInstDll>    ; 48 B9 [8字节]
      *   mov  edx, 1
      *   xor  r8d, r8d
      *   mov  rax, <dllMain>     ; 48 B8 [8字节]
-     *   call rax
+     *   call rax                ; 共 30 字节，恰好是 jne 的偏移 0x1E
+     * skip:
      *   mov  rsp, rbp           ; 恢复对齐前 RSP
      *   pop  rbp
      *   pop  r11/r10/r9/r8/rdx/rcx ; 逆序恢复 6 个寄存器（rax 留在栈上）
@@ -353,24 +370,38 @@ public:
         if (type == Type::ReturnBack) {
             // sub rsp, 0x28
             emit({0x48, 0x83, 0xEC, 0x28});
-            // mov rcx, <hInstDll>
+            // call-once CAS 门卫
+            // xor eax, eax  (expected = 0)
+            emit({0x33, 0xC0});
+            // mov ecx, 1   (new = 1)
+            emit({0xB9, 0x01, 0x00, 0x00, 0x00});
+            // mov rdx, <flag_addr>   ; 48 BA [8字节]
+            emit({0x48, 0xBA});
+            offFlag = emitImm64();
+            // lock cmpxchg [rdx], ecx  ; F0 0F B1 0A
+            emit({0xF0, 0x0F, 0xB1, 0x0A});
+            // jne skip (+0x1E = 30字节，跳过 DllMain 调用块)
+            emit({0x75, 0x1E});
+            // DllMain 调用块（共 30 字节）
+            // mov rcx, <hInstDll>    ; 10字节
             emit({0x48, 0xB9});
             offHInstance = emitImm64();
-            // mov edx, 1
+            // mov edx, 1             ;  5字节
             emit({0xBA, 0x01, 0x00, 0x00, 0x00});
-            // xor r8d, r8d
+            // xor r8d, r8d           ;  3字节
             emit({0x45, 0x33, 0xC0});
-            // mov rax, <dllMain>
+            // mov rax, <dllMain>     ; 10字节
             emit({0x48, 0xB8});
             offDllMain = emitImm64();
-            // call rax
+            // call rax               ;  2字节
             emit({0xFF, 0xD0});
+            // skip: 
             // add rsp, 0x28
             emit({0x48, 0x83, 0xC4, 0x28});
             // ret
             emit({0xC3});
         } else if (type == Type::JumpBack) {
-            // JumpBack: 通过劫持上下文执行，完整保存/恢复所有易失寄存器，强制对齐
+            // 所有线程：保存寄存器 + 对齐
             // push rax, rcx, rdx, r8, r9, r10, r11
             emit({0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53});
             // push rbp
@@ -381,18 +412,36 @@ public:
             emit({0x48, 0x83, 0xE4, 0xF0});
             // sub rsp, 0x20
             emit({0x48, 0x83, 0xEC, 0x20});
-            // mov rcx, <hInstDll>
+
+            // call-once CAS 门卫
+            // xor eax, eax  (expected = 0)
+            emit({0x33, 0xC0});
+            // mov ecx, 1   (new = 1)
+            emit({0xB9, 0x01, 0x00, 0x00, 0x00});
+            // mov rdx, <flag_addr>   ; 48 BA [8字节]
+            emit({0x48, 0xBA});
+            offFlag = emitImm64();
+            // lock cmpxchg [rdx], ecx  ; F0 0F B1 0A
+            emit({0xF0, 0x0F, 0xB1, 0x0A});
+            // jne skip (+0x1E = 30字节，跳过 DllMain 调用块)
+            emit({0x75, 0x1E});
+
+            // DllMain 调用块（仅 CAS 胜出的线程执行，共 30 字节）
+            // mov rcx, <hInstDll>    ; 10字节
             emit({0x48, 0xB9});
             offHInstance = emitImm64();
-            // mov edx, 1
+            // mov edx, 1             ;  5字节
             emit({0xBA, 0x01, 0x00, 0x00, 0x00});
-            // xor r8d, r8d
+            // xor r8d, r8d           ;  3字节
             emit({0x45, 0x33, 0xC0});
-            // mov rax, <dllMain>
+            // mov rax, <dllMain>     ; 10字节
             emit({0x48, 0xB8});
             offDllMain = emitImm64();
-            // call rax
+            // call rax               ;  2字节
             emit({0xFF, 0xD0});
+            // skip:
+            
+            // 所有线程：恢复寄存器，跳回原 RIP
             // mov rsp, rbp
             emit({0x48, 0x89, 0xEC});
             // pop rbp
@@ -443,6 +492,8 @@ public:
         }
     }
 
+    Type getType() const { return stubType; }
+
     Stub& setDllMain(PVOID dllMainAddress) {
         patchImm64(offDllMain, reinterpret_cast<uint64_t>(dllMainAddress));
         return *this;
@@ -457,8 +508,13 @@ public:
         return *this;
     }
     Stub& setLpDllPathW(LPCWSTR remoteDllPathW) {
-        if (stubType == Type::LoadDll || stubType == Type::LoadDllReturn)
+        if (stubType == Type::LoadDll)
             patchImm64(offDllPath, reinterpret_cast<uint64_t>(remoteDllPathW));
+        return *this;
+    }
+    Stub& setFlagAddr(PVOID remoteFlagAddr) {
+        if (stubType == Type::JumpBack || stubType == Type::ReturnBack)
+            patchImm64(offFlag, reinterpret_cast<uint64_t>(remoteFlagAddr));
         return *this;
     }
 
@@ -469,10 +525,19 @@ public:
 
 class RemoteProcess {
 protected:
-    HANDLE hProcess;
+    HANDLE hProcess = NULL;
 public:
     RemoteProcess(DWORD processId) {
         hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
+    }
+    RemoteProcess(const RemoteProcess& rhs) {
+        DuplicateHandle(GetCurrentProcess(),
+                        rhs.hProcess,
+                        GetCurrentProcess(),
+                        &hProcess,
+                        0,
+                        FALSE,
+                        DUPLICATE_SAME_ACCESS);
     }
     ~RemoteProcess() {
         if (hProcess) {
@@ -480,19 +545,23 @@ public:
         }
     }
 
-    HANDLE getHandle() const {
-        return hProcess;
+    RemoteProcess& operator=(const RemoteProcess& rhs) {
+        if (hProcess) {
+            CloseHandle(hProcess);
+            hProcess = NULL;
+        }
+        DuplicateHandle(GetCurrentProcess(),
+                        rhs.hProcess,
+                        GetCurrentProcess(),
+                        &hProcess,
+                        0,
+                        FALSE,
+                        DUPLICATE_SAME_ACCESS);
+        return *this;
     }
 
-    HMODULE getModuleAddress(const std::string& dllName) const {
-        std::wstring dllNameW = ToUtf16(dllName);
-        dllNameW.push_back(0);
-        return GetRemoteModuleHandle(GetProcessId(hProcess), dllNameW.c_str());
-    }
-    PVOID getProcAddress(HMODULE hRemoteModule, const std::string& moduleName, LPCSTR procName) const {
-        std::wstring dllNameW = ToUtf16(moduleName);
-        dllNameW.push_back(0);
-        return (PVOID)GetRemoteProcAddress(hRemoteModule, dllNameW.c_str(), procName);
+    HANDLE getHandle() const {
+        return hProcess;
     }
 
     BOOL writeMemory(LPVOID remoteBaseAddress, LPCVOID buffer, SIZE_T bytesToWrite) const {
@@ -513,11 +582,82 @@ public:
         return VirtualProtectEx(hProcess, baseAddress, setSize, protect, &oldProtect);
     }
 
-    HANDLE createThread(PVOID startAddress) const {
-        return CreateRemoteThread(hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)startAddress, nullptr, 0, nullptr);
+    HANDLE createThread(PVOID startAddress, PVOID lpParameter = nullptr) const {
+        return CreateRemoteThread(hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)startAddress, lpParameter, 0, nullptr);
     }
 
-    BOOL hijackRun(Stub stub, bool guiThreadOnly = true) const {
+    BOOL hijackRun(Stub stub, bool guiThreadOnly = false) const {
+        DWORD pid = GetProcessId(hProcess);
+
+        // 必须是JumpBack
+        if (stub.getType() != Stub::Type::JumpBack) {
+            return FALSE;
+        }
+
+        // 分配call-once全局标志
+        PVOID remoteFlag = alloc(4);
+        uint32_t zeroFlag = 0;
+        writeMemory(remoteFlag, &zeroFlag, 4);
+
+        // 写入Stub
+        stub.setFlagAddr(remoteFlag);
+        Log::Debug(std::format("Global call-once flag address: {:#x}", (uint64_t)remoteFlag));
+
+        // 线程快照
+        HANDLE hAllThreads = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid);
+        if (hAllThreads == INVALID_HANDLE_VALUE) {
+            return FALSE;
+        }
+        
+        // 枚举所有匹配线程，每个都注入 stub
+        THREADENTRY32 te{};
+        te.dwSize = sizeof(te);
+        if (Thread32First(hAllThreads, &te)) {
+            do {
+                if (te.th32OwnerProcessID == pid && (!guiThreadOnly || ThreadWindows(te.th32ThreadID).hasWindow())) {
+                    HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
+                    if (hThread == NULL) {
+                        continue;
+                    }
+
+                    // 暂停线程，获取上下文
+                    CONTEXT ctx{};
+                    ctx.ContextFlags = CONTEXT_FULL;
+                    SuspendThread(hThread);
+                    GetThreadContext(hThread, &ctx);
+
+                    // 每个线程有独立的 originRip，但共享同一个 flag_addr
+                    std::vector<uint8_t> shellcode = stub.setOriginRip(ctx.Rip).toBytes();
+
+                    // 写入目标进程
+                    PVOID remoteShellcode = alloc(shellcode.size(), PAGE_EXECUTE_READWRITE);
+                    writeMemory(remoteShellcode, shellcode.data(), shellcode.size());
+
+                    // 设置Rip
+                    ctx.Rip = (DWORD64)remoteShellcode;
+
+                    // 写回上下文，继续执行
+                    BOOL ret = SetThreadContext(hThread, &ctx);
+                    DWORD lastErr = GetLastError();
+                    ResumeThread(hThread);
+                    CloseHandle(hThread);
+
+                    if (ret) {
+                        // 劫持成功
+                        Log::Debug(std::format("Hajack thread {} Rip to {:#x}", te.th32ThreadID, ctx.Rip));
+                    } else {
+                        // 失败
+                        Log::Error(std::format("Hiject fail! Last Error: {}", lastErr));
+                    }
+                }
+            } while (Thread32Next(hAllThreads, &te));
+        }
+        CloseHandle(hAllThreads);
+        return TRUE;
+    }
+
+    BOOL queueAPCRun(PVOID startAddress, PVOID lpParameter = nullptr, bool guiThreadOnly = false) const {
+        // 只注入GUI进程
         DWORD pid = GetProcessId(hProcess);
         // 线程快照
         HANDLE hAllThreads = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid);
@@ -533,72 +673,15 @@ public:
                 if (te.th32OwnerProcessID == pid && (!guiThreadOnly || ThreadWindows(te.th32ThreadID).hasWindow())) {
                     // 只处理目标进程
 
-                    // 打开句柄
+                    // 注入APC
                     HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
                     if (hThread == NULL) {
                         continue;
                     }
-
-                    // 暂停线程，获取上下文
-                    CONTEXT ctx{};
-                    ctx.ContextFlags = CONTEXT_FULL;
-                    SuspendThread(hThread);
-                    GetThreadContext(hThread, &ctx);
-
-                    // 完成Stub shellcode
-                    std::vector<uint8_t> shellcode = stub.setOriginRip(ctx.Rip).toBytes();
-
-                    // 写入目标进程
-                    PVOID remoteShellcode = alloc(shellcode.size(), PAGE_EXECUTE_READWRITE);
-                    writeMemory(remoteShellcode, shellcode.data(), shellcode.size());
-
-                    // 设置Rip
-                    ctx.Rip = (DWORD64)remoteShellcode;
-
-                    // 写回上下文，继续执行
-                    SetThreadContext(hThread, &ctx);
-                    ResumeThread(hThread);
-
-                    // 关闭句柄
+                    QueueUserAPC((PAPCFUNC)startAddress, hThread, (ULONG_PTR)lpParameter);
                     CloseHandle(hThread);
 
-                    Log::Info(std::format("Hajack thread {} Rip to {:#x}", te.th32ThreadID, ctx.Rip));
-                }
-            } while (Thread32Next(hAllThreads, &te));
-        }
-        return TRUE;
-    }
-
-    BOOL queueAPCRun(PVOID startAddress) const {
-        // 只注入GUI进程
-        DWORD pid = GetProcessId(hProcess);
-        // 线程快照
-        HANDLE hAllThreads = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid);
-        if (hAllThreads == INVALID_HANDLE_VALUE) {
-            return FALSE;
-        }
-        
-        // 枚举
-        THREADENTRY32 te{};
-        te.dwSize = sizeof(te);
-        if (Thread32First(hAllThreads, &te)) {
-            do {
-                if (te.th32OwnerProcessID == pid) {
-                    // 只处理目标进程
-
-                    // 探测是否是GUI线程且有窗口
-                    bool isGuiThread = ThreadWindows(te.th32ThreadID).hasWindow();
-                    if (isGuiThread) {
-                        // 是GUI线程，注入APC
-                        HANDLE hThread = OpenThread(THREAD_ALL_ACCESS, FALSE, te.th32ThreadID);
-                        if (hThread == NULL) {
-                            continue;
-                        }
-                        QueueUserAPC((PAPCFUNC)startAddress, hThread, 0);
-                        CloseHandle(hThread);
-
-                        Log::Info(std::format("Inject APC into thread {}", te.th32ThreadID));
-                    }
+                    Log::Debug(std::format("Inject APC into thread {}", te.th32ThreadID));
                 }
             } while (Thread32Next(hAllThreads, &te));
         }
@@ -606,26 +689,44 @@ public:
     }
 
     BOOL loadDll(const std::string& dllPath) const {
-        // 转UTF16
         std::wstring dllPathW = ToUtf16(dllPath);
-        dllPathW.push_back(0);
 
-        // 获取完整路径
-        std::wstring dllFullPathW;
-        dllFullPathW.resize(MAX_PATH);
-        GetFullPathNameW(dllPathW.c_str(), MAX_PATH - 1, dllFullPathW.data(), nullptr);
+        // 解析完整路径：
+        //   裸文件名（不含路径分隔符） → SearchPathW 在系统/应用路径中查找
+        //   含路径分隔符              → GetFullPathNameW 转绝对路径
+        std::wstring dllFullPathW(MAX_PATH, L'\0');
+        bool hasSep = dllPathW.find(L'\\') != std::wstring::npos
+                   || dllPathW.find(L'/')  != std::wstring::npos;
+        if (!hasSep) {
+            DWORD found = SearchPathW(nullptr, dllPathW.c_str(), nullptr,
+                                      MAX_PATH, dllFullPathW.data(), nullptr);
+            if (found == 0) {
+                // 系统路径中找不到，回退到原名（让远程进程自行搜索）
+                dllFullPathW = dllPathW;
+            } else {
+                dllFullPathW.resize(found);
+            }
+        } else {
+            DWORD len = GetFullPathNameW(dllPathW.c_str(), MAX_PATH,
+                                         dllFullPathW.data(), nullptr);
+            dllFullPathW.resize(len);
+        }
+        dllFullPathW.push_back(L'\0');
+        Log::Info(std::format("Dll full path: {}", FromUtf16(dllFullPathW)));
 
         // 写入目标进程
-        PVOID remoteDllPath = alloc(dllFullPathW.size() * sizeof(wchar_t));
-        writeMemory(remoteDllPath, dllFullPathW.c_str(), dllFullPathW.size() * sizeof(wchar_t));
+        SIZE_T pathBytes = dllFullPathW.size() * sizeof(wchar_t);
+        PVOID remoteDllPath = alloc(pathBytes);
+        writeMemory(remoteDllPath, dllFullPathW.c_str(), pathBytes);
 
-        // 构造Stub
-        Stub stub = Stub(Stub::Type::LoadDll).setLpDllPathW((LPCWSTR)remoteDllPath);
+        // 在远程进程中调用 LoadLibraryW(remoteDllPath)
+        HMODULE hKernel32 = GetModuleHandleW(L"kernel32.dll");
+        PVOID pLoadLibraryW = (PVOID)GetProcAddress(hKernel32, "LoadLibraryW");
 
-        hijackRun(stub, false);
+        // APC方式
+        queueAPCRun(pLoadLibraryW, remoteDllPath, false);
 
         Log::Info(std::format("Normal load dll: {} into {}", dllPath, getID()));
-
         return TRUE;
     }
     std::vector<MODULEENTRY32W> getLoadedDlls() const {
@@ -643,11 +744,178 @@ public:
                 dlls.push_back(me);
             } while (Module32NextW(hAllDlls, &me));
         }
+
+        CloseHandle(hAllDlls);
         return dlls;
     }
+    MODULEENTRY32W getDllInfo(const std::string& dllName) const {
+        // 转UTF16
+        std::wstring dllNameW = ToUtf16(dllName);
+        dllNameW.push_back(0);
 
+        MODULEENTRY32W result{};
+        
+        // 快照
+        HANDLE hAllDlls = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetProcessId(hProcess));
+        if (hAllDlls == INVALID_HANDLE_VALUE) {
+            return {};
+        }
+        
+        // 遍历所有dll
+        MODULEENTRY32W me{};
+        me.dwSize = sizeof(me);
+        if (Module32FirstW(hAllDlls, &me)) {
+            do {
+                if (!_wcsicmp(dllNameW.c_str(), me.szModule)) {
+                    result = me;
+                    break;
+                }
+            } while (Module32NextW(hAllDlls, &me));
+        }
+
+        CloseHandle(hAllDlls);
+        return result;
+    }
+    PPEB getPebAddress() const {
+        PROCESS_BASIC_INFORMATION remoteProcessInfo{};
+        ULONG readSize = 0;
+
+        NtQueryInformationProcess(hProcess, ProcessBasicInformation, &remoteProcessInfo, sizeof(remoteProcessInfo), &readSize);
+        if (readSize == 0) {
+            return nullptr;
+        }
+
+        return remoteProcessInfo.PebBaseAddress;
+    }
     DWORD getID() const {
         return GetProcessId(hProcess);
+    }
+};
+
+class RemoteModule {
+    RemoteProcess proc;
+    BYTE* base = nullptr;   // 远程基址
+    std::string name;      // 模块名 (UTF-8)
+
+    // 缓存的导出表信息（首次 getProcAddress 时惰性加载）
+    bool    expLoaded = false;
+    bool    expValid  = false;
+    DWORD   expRVA    = 0;
+    DWORD   expSize   = 0;
+    DWORD   expBase   = 0;         // IMAGE_EXPORT_DIRECTORY.Base
+    std::vector<DWORD> functions;  // AddressOfFunctions
+    std::vector<DWORD> names;      // AddressOfNames
+    std::vector<WORD>  ordinals;   // AddressOfNameOrdinals
+
+    // 惰性加载导出表
+    bool ensureExportTable() {
+        if (expLoaded) return expValid;
+        expLoaded = true;
+
+        IMAGE_DOS_HEADER dosHeader;
+        if (!proc.readMemory(base, &dosHeader, sizeof(dosHeader))
+            || dosHeader.e_magic != IMAGE_DOS_SIGNATURE)
+            return false;
+
+        IMAGE_NT_HEADERS64 ntHeaders;
+        if (!proc.readMemory(base + dosHeader.e_lfanew, &ntHeaders, sizeof(ntHeaders))
+            || ntHeaders.Signature != IMAGE_NT_SIGNATURE)
+            return false;
+
+        auto& dir = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        if (dir.VirtualAddress == 0 || dir.Size == 0)
+            return false;
+
+        expRVA  = dir.VirtualAddress;
+        expSize = dir.Size;
+
+        IMAGE_EXPORT_DIRECTORY expDir;
+        if (!proc.readMemory(base + expRVA, &expDir, sizeof(expDir)))
+            return false;
+
+        DWORD numFuncs = expDir.NumberOfFunctions;
+        DWORD numNames = expDir.NumberOfNames;
+        expBase = expDir.Base;
+        if (numFuncs == 0) return false;
+
+        functions.resize(numFuncs);
+        proc.readMemory(base + expDir.AddressOfFunctions,
+                         functions.data(), numFuncs * sizeof(DWORD));
+
+        if (numNames) {
+            names.resize(numNames);
+            ordinals.resize(numNames);
+            proc.readMemory(base + expDir.AddressOfNames,
+                             names.data(), numNames * sizeof(DWORD));
+            proc.readMemory(base + expDir.AddressOfNameOrdinals,
+                             ordinals.data(), numNames * sizeof(WORD));
+        }
+
+        expValid = true;
+        return true;
+    }
+
+public:
+    RemoteModule(const RemoteProcess& proc, HMODULE hModule, const std::string& name = {})
+        : proc(proc)
+        , base((BYTE*)hModule)
+        , name(name)
+    {}
+
+    HMODULE getBase() const { return (HMODULE)base; }
+    const std::string& getName() const { return name; }
+    explicit operator bool() const { return base != nullptr; }
+
+    // 通过读取远程导出表解析函数地址
+    // procName 可以是字符串名称，也可以是 MAKEINTRESOURCEA(ordinal)
+    PVOID getProcAddress(LPCSTR procName) {
+        if (!ensureExportTable()) return nullptr;
+
+        DWORD funcIndex = (DWORD)-1;
+
+        if (IS_INTRESOURCE(procName)) {
+            WORD ordinal = LOWORD((DWORD_PTR)procName);
+            funcIndex = ordinal - (WORD)expBase;
+        } else {
+            for (DWORD i = 0; i < (DWORD)names.size(); i++) {
+                char nameBuffer[512]{};
+                proc.readMemory(base + names[i],
+                                 nameBuffer, sizeof(nameBuffer) - 1);
+                if (strcmp(nameBuffer, procName) == 0) {
+                    funcIndex = ordinals[i];
+                    break;
+                }
+            }
+        }
+
+        if (funcIndex >= (DWORD)functions.size()) return nullptr;
+
+        DWORD funcRVA = functions[funcIndex];
+
+        // 转发导出：RVA 落在导出目录区间内
+        if (funcRVA >= expRVA && funcRVA < expRVA + expSize) {
+            char fwdStr[256]{};
+            proc.readMemory(base + funcRVA, fwdStr, sizeof(fwdStr) - 1);
+
+            char* dot = strchr(fwdStr, '.');
+            if (!dot) return nullptr;
+            *dot = '\0';
+            char* fwdFunc = dot + 1;
+
+            char fwdModuleName[256];
+            _snprintf_s(fwdModuleName, sizeof(fwdModuleName), _TRUNCATE, "%s.dll", fwdStr);
+
+            HMODULE hFwd = proc.getDllInfo(fwdModuleName).hModule;
+            if (!hFwd) return nullptr;
+
+            RemoteModule fwd(proc, hFwd, std::string(fwdModuleName));
+            LPCSTR fwdProcName = (fwdFunc[0] == '#')
+                ? MAKEINTRESOURCEA(atoi(fwdFunc + 1))
+                : (LPCSTR)fwdFunc;
+            return fwd.getProcAddress(fwdProcName);
+        }
+
+        return (PVOID)(base + funcRVA);
     }
 };
 
@@ -738,7 +1006,7 @@ protected:
         }
 
         // 读取远程 PEB::ApiSetMap
-        PVOID pebAddr = GetRemoteProcessPebAddress(GetProcessId(proc.getHandle()));
+        PVOID pebAddr = proc.getPebAddress();
         if (!pebAddr) return dllName;
 
         PEB_FULL peb{};
@@ -880,11 +1148,11 @@ public:
         PIMAGE_IMPORT_DESCRIPTOR importTable = (PIMAGE_IMPORT_DESCRIPTOR)(mapSpace + ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
 
         // 记录已加载过的dll
-        std::set<std::string, CompareStringIgnoreCase> loadedDll;
+        std::map<std::string, MODULEENTRY32W, CompareStringIgnoreCase> loadedDll;
         std::vector<MODULEENTRY32W> loadedModules = proc.getLoadedDlls();
         for (MODULEENTRY32W& me: loadedModules) {
             std::string dllName = FromUtf16(me.szModule);
-            loadedDll.insert(dllName);
+            loadedDll[dllName] = me;
         }
 
         for (; importTable->Name; importTable++) {
@@ -892,16 +1160,25 @@ public:
             std::string dllName = (const char*)(mapSpace + importTable->Name);
 
             // 解析到实际DLL名称
+            std::string originDllName = dllName;
             dllName = toRealDllName(dllName, proc);
+            Log::Debug(std::format("Dll name: {} -> {}", originDllName, dllName));
 
             // 如果未加载该dll，则加载
             if (loadedDll.find(dllName) == loadedDll.end()) {
+                Log::Warning(std::format("Module {} not loaded, try load", dllName));
                 proc.loadDll(dllName);
-                loadedDll.insert(dllName);
+                MODULEENTRY32W me = proc.getDllInfo(dllName);
+                loadedDll[dllName] = me;
+                Log::Success(std::format("Remote load {} success, base address: {:#x}", dllName, (uint64_t)me.hModule));
             }
 
             // 远程dll地址
-            HMODULE hRemoteModule = proc.getModuleAddress(dllName);
+            HMODULE hRemoteModule = loadedDll[dllName].hModule;
+            Log::Debug(std::format("Remote module: {}, base address: {:#x}", dllName, (uint64_t)hRemoteModule));
+
+            // 构建 RemoteModule，缓存导出表供本DLL所有导入项复用
+            RemoteModule remoteModule(proc, hRemoteModule, dllName);
 
             // 获取INT(Import Name Table)和IAT(Import Address Table)
             PIMAGE_THUNK_DATA originalThunk = (PIMAGE_THUNK_DATA)(mapSpace + importTable->OriginalFirstThunk);
@@ -918,13 +1195,13 @@ public:
                 if (IMAGE_SNAP_BY_ORDINAL(originalThunk->u1.Ordinal)) {
                     // 按序号导入
                     WORD ordinal = IMAGE_ORDINAL(originalThunk->u1.Ordinal);
-                    funcAddr = proc.getProcAddress(hRemoteModule, dllName, MAKEINTRESOURCEA(ordinal));
+                    funcAddr = remoteModule.getProcAddress(MAKEINTRESOURCEA(ordinal));
 
                     Log::Debug(std::format("Import: {} -> {:#x}", ordinal, (uint64_t)funcAddr));
                 } else {
                     // 按名称导入
                     PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)(mapSpace + originalThunk->u1.AddressOfData);
-                    funcAddr = proc.getProcAddress(hRemoteModule, dllName, importByName->Name);
+                    funcAddr = remoteModule.getProcAddress(importByName->Name);
 
                     Log::Debug(std::format("Import: {} -> {:#x}", importByName->Name, (uint64_t)funcAddr));
                 }
@@ -972,7 +1249,7 @@ public:
         mapped = true;
     }
 
-    BOOL injectInto(const RemoteProcess& process, InjectMethod method = InjectMethod::HijackThread) {
+    BOOL injectInto(const RemoteProcess& process, InjectMethod method = InjectMethod::HijackThread, bool guiOnly = true) {
         if (!mapped) {
             buildMemoryImage();
         }
@@ -991,6 +1268,7 @@ public:
 
         // 复制完整镜像
         process.writeMemory(remoteImageBase, mapSpace, ntHeader->OptionalHeader.SizeOfImage);
+        Log::Info(std::format("Write image into remote process[{:#x}]", (uint64_t)remoteImageBase));
 
         // 设置节保护
         std::vector<IMAGE_SECTION_HEADER> sectionTable = loader.getSectionTable();
@@ -1004,8 +1282,11 @@ public:
             process.setProtect(target, section.Misc.VirtualSize, protect);
         }
 
-        // 运行DllMain
+        // 入口点
         PVOID dllMain = remoteImageBase + ntHeader->OptionalHeader.AddressOfEntryPoint;
+        Log::Info(std::format("Entry point: {:#x}", (uint64_t)dllMain));
+
+        // 运行DllMain
         if (method == InjectMethod::HijackThread) {
             // 劫持线程上下文方式
             // 构造Stub
@@ -1013,12 +1294,18 @@ public:
                                                   .setDllMain(dllMain);
 
             // 劫持执行
-            process.hijackRun(stub);
+            process.hijackRun(stub, guiOnly);
         } else if (method == InjectMethod::QueueAPC) {
             // APC方式
+            // 分配全局Call once flag
+            PVOID remoteFlag = process.alloc(sizeof(DWORD));
+            uint32_t zero = 0;
+            process.writeMemory(remoteFlag, &zero, sizeof(zero));
+
             // 构造Stub
             std::vector<uint8_t> stub = Stub(Stub::Type::ReturnBack).setDllMain(dllMain)
                                                                     .setHInstance((HINSTANCE)remoteImageBase)
+                                                                    .setFlagAddr(remoteFlag)
                                                                     .toBytes();
                                                                 
             // 写入Stub Shellcode
@@ -1026,12 +1313,18 @@ public:
             process.writeMemory(remoteStub, stub.data(), stub.size());
             
             // 注入APC
-            process.queueAPCRun(remoteStub);
+            process.queueAPCRun(remoteStub, nullptr, guiOnly);
         } else if (method == InjectMethod::RemoteThread) {
             // 远程线程方式
+            // 分配全局Call once flag
+            PVOID remoteFlag = process.alloc(sizeof(DWORD));
+            uint32_t zero = 0;
+            process.writeMemory(remoteFlag, &zero, sizeof(zero));
+
             // 构造Stub
             std::vector<uint8_t> stub = Stub(Stub::Type::ReturnBack).setDllMain(dllMain)
                                                                     .setHInstance((HINSTANCE)remoteImageBase)
+                                                                    .setFlagAddr(remoteFlag)
                                                                     .toBytes();
                                                                 
             // 写入Stub Shellcode
@@ -1083,6 +1376,5 @@ void QuickInject(const std::string& processImageFileName, const std::string& dll
 }
 
 } // namespace PEMapper
-
 
 #endif

@@ -1,19 +1,8 @@
-#ifndef GET_INFO_UTILS
+﻿#ifndef GET_INFO_UTILS
 #define GET_INFO_UTILS
 
-#ifndef UNICODE
-#define UNICODE
-#endif
-#ifndef _UNICODE
-#define _UNICODE
-#endif
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <stdint.h>
 #include <windows.h>
-#include <tlhelp32.h>
 #include <winternl.h>
 
 // PEB_LDR_DATA的完整定义
@@ -151,83 +140,5 @@ typedef struct _PEB_FULL   /* Size=0x7c8 */
     /* 0x07c0 */ uint32_t LeapSecondFlags;
     /* 0x07c4 */ uint32_t NtGlobalFlag2;
 } PEB_FULL, *PPEB_FULL;
-
-// 获取远程模块句柄
-static inline HMODULE GetRemoteModuleHandle(DWORD processId, LPCWSTR moduleName);
-// 获取远程模块函数地址
-static inline DWORD_PTR GetRemoteProcAddress(HMODULE hRemoteModule, LPCWSTR moduleName, LPCSTR procName);
-// 获取远程进程PEB地址
-static inline PPEB GetRemoteProcessPebAddress(DWORD processId);
-
-// 获取远程模块句柄
-static inline HMODULE GetRemoteModuleHandle(DWORD processId, LPCWSTR moduleName)
-{
-    // 对进程中所有模块快照
-    HANDLE hAllModule = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId);
-    if (hAllModule == INVALID_HANDLE_VALUE) {
-        return NULL;
-    }
-    
-    // 遍历快照，找到模块名匹配的
-    HMODULE resulthModule = NULL;
-    MODULEENTRY32W me = {};
-    me.dwSize = sizeof(me);
-    if (!Module32FirstW(hAllModule, &me)) {
-        CloseHandle(hAllModule);
-        return NULL;
-    }
-    do {
-        if (!_wcsicmp(moduleName, me.szModule)) {
-            resulthModule = me.hModule;
-            break;
-        }
-    } while (Module32NextW(hAllModule, &me));
-    CloseHandle(hAllModule);
-    
-    return resulthModule;
-}
-
-// 获取远程模块函数地址
-static inline DWORD_PTR GetRemoteProcAddress(HMODULE hRemoteModule, LPCWSTR moduleName, LPCSTR procName)
-{
-    // 加载模块，获取函数地址
-    HMODULE hModule = LoadLibraryW(moduleName);
-    if (hModule == NULL) {
-        return (DWORD_PTR)NULL;
-    }
-    FARPROC procAddr = GetProcAddress(hModule, procName);
-    FreeLibrary(hModule);
-    if (procAddr == NULL) {
-        return (DWORD_PTR)NULL;
-    }
-    
-    // 计算偏移量
-    DWORD_PTR offset = (DWORD_PTR)procAddr - (DWORD_PTR)hModule;
-
-    // 将偏移量加在基址（模块句柄）上返回
-    return (DWORD_PTR)hRemoteModule + (DWORD_PTR)offset;
-}
-
-// 获取远程进程PEB地址
-static inline PPEB GetRemoteProcessPebAddress(DWORD processId)
-{
-    PROCESS_BASIC_INFORMATION remoteProcessInfo = {};
-    ULONG readSize = 0;
-
-    // 打开进程
-    HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
-    if (hProcess == NULL) goto err;
-
-    // 获取PEB地址
-    NtQueryInformationProcess(hProcess, ProcessBasicInformation, &remoteProcessInfo, sizeof(remoteProcessInfo), &readSize);
-    if (readSize == 0) goto err;
-
-    CloseHandle(hProcess);
-    return remoteProcessInfo.PebBaseAddress;
-
-    err:
-    CloseHandle(hProcess);
-    return NULL;
-}
 
 #endif
