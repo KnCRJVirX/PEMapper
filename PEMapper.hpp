@@ -14,6 +14,7 @@
 #include <TlHelp32.h>
 
 #include "Utils.h"
+#include "NtFuncs.hpp"
 
 namespace PEMapper {
 
@@ -74,6 +75,7 @@ protected:
     static constexpr const char* GREEN  = "\033[32m";
     static constexpr const char* YELLOW = "\033[33m";
     static constexpr const char* BLUE   = "\033[34m";
+    static constexpr const char* WHITE  = "\033[37m";
     static constexpr const char* RESET  = "\033[0m";
 public:
     enum class Level {
@@ -94,7 +96,7 @@ public:
     }
     static void Info(const std::string_view message) {
         if (level <= Level::Info) {
-            std::cout           << "[PEMapper][Info]    " << message << std::endl;
+            std::cout << WHITE  << "[PEMapper][Info]    " << RESET << message << std::endl;
         }
     }
     static void Debug(const std::string_view message) {
@@ -103,7 +105,7 @@ public:
         }
     }
     static void Success(const std::string_view message) {
-        std::cout << GREEN      << "[PEMapper][Success] " << RESET << message << std::endl;
+            std::cout << GREEN  << "[PEMapper][Success] " << RESET << message << std::endl;
     }
 };
 
@@ -131,13 +133,14 @@ protected:
     PIMAGE_NT_HEADERS ntHeader = nullptr;
     std::vector<IMAGE_SECTION_HEADER> sectionTable;
 public:
+    Loader() {}
     Loader(const std::string& filePath): path(filePath) {
         hFile = CreateFileW(ToUtf16(path).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
         if (hFile != INVALID_HANDLE_VALUE) {
             inited = true;
         }
     }
-    ~Loader() {
+    virtual ~Loader() {
         if (inited) {
             CloseHandle(hFile);
             if (dosHeader) delete dosHeader;
@@ -146,8 +149,7 @@ public:
         
     }
 
-    template <typename T>
-    T* read(T* buffer, size_t bytesToRead, int64_t readPos = -1) {
+    virtual void* read(void* buffer, size_t bytesToRead, int64_t readPos = -1) {
         if (!inited) {
             return nullptr;
         }
@@ -162,7 +164,7 @@ public:
         return buffer;
     }
 
-    PIMAGE_DOS_HEADER getDosHeader() {
+    virtual PIMAGE_DOS_HEADER getDosHeader() {
         if (!inited) {
             return nullptr;
         }
@@ -180,7 +182,7 @@ public:
         
         return dosHeader;
     }
-    PIMAGE_NT_HEADERS64 getNtHeader() {
+    virtual PIMAGE_NT_HEADERS64 getNtHeader() {
         if (!inited) {
             return nullptr;
         }
@@ -203,7 +205,7 @@ public:
         
         return ntHeader;
     }
-    std::vector<IMAGE_SECTION_HEADER> getSectionTable() {
+    virtual std::vector<IMAGE_SECTION_HEADER> getSectionTable() {
         if (!inited) {
             return {};
         }
@@ -223,14 +225,8 @@ public:
         
         return sectionTable;
     }
-    bool isInited() const {
+    virtual bool isInited() const {
         return inited;
-    }
-    HANDLE getFileHandle() const {
-        if (!inited) {
-            return INVALID_HANDLE_VALUE;
-        }
-        return hFile;
     }
 };
 
@@ -630,8 +626,10 @@ public:
                     std::vector<uint8_t> shellcode = stub.setOriginRip(ctx.Rip).toBytes();
 
                     // 写入目标进程
-                    PVOID remoteShellcode = alloc(shellcode.size(), PAGE_EXECUTE_READWRITE);
-                    writeMemory(remoteShellcode, shellcode.data(), shellcode.size());
+                    uint64_t stubSize = shellcode.size();
+                    PVOID remoteShellcode = alloc(stubSize, PAGE_READWRITE);
+                    writeMemory(remoteShellcode, shellcode.data(), stubSize);
+                    setProtect(remoteShellcode, stubSize, PAGE_EXECUTE_READ);
 
                     // 设置Rip
                     ctx.Rip = (DWORD64)remoteShellcode;
@@ -678,7 +676,8 @@ public:
                     if (hThread == NULL) {
                         continue;
                     }
-                    QueueUserAPC((PAPCFUNC)startAddress, hThread, (ULONG_PTR)lpParameter);
+
+                    QueueSpecialUserAPC((Syscall::PPS_APC_ROUTINE)startAddress, hThread, lpParameter, nullptr, nullptr);
                     CloseHandle(hThread);
 
                     Log::Debug(std::format("Inject APC into thread {}", te.th32ThreadID));
@@ -861,6 +860,10 @@ public:
         , base((BYTE*)hModule)
         , name(name)
     {}
+    RemoteModule(const RemoteProcess& proc, const MODULEENTRY32W& me): proc(proc) {
+        base = me.modBaseAddr;
+        name = FromUtf16(me.szModule);
+    }
 
     HMODULE getBase() const { return (HMODULE)base; }
     const std::string& getName() const { return name; }
@@ -905,10 +908,7 @@ public:
             char fwdModuleName[256];
             _snprintf_s(fwdModuleName, sizeof(fwdModuleName), _TRUNCATE, "%s.dll", fwdStr);
 
-            HMODULE hFwd = proc.getDllInfo(fwdModuleName).hModule;
-            if (!hFwd) return nullptr;
-
-            RemoteModule fwd(proc, hFwd, std::string(fwdModuleName));
+            RemoteModule fwd(proc, proc.getDllInfo(fwdModuleName));
             LPCSTR fwdProcName = (fwdFunc[0] == '#')
                 ? MAKEINTRESOURCEA(atoi(fwdFunc + 1))
                 : (LPCSTR)fwdFunc;
@@ -969,7 +969,7 @@ public:
     }
 protected:
     Loader& loader;
-    PBYTE mapSpace = nullptr;
+    PBYTE imageSpace = nullptr;
     bool mapped = false;
 
     static DWORD sectionToPageProtect(DWORD sectionCharacteristics) {
@@ -1086,14 +1086,14 @@ protected:
 public:
     Mapper(Loader& _loader): loader(_loader) {}
     ~Mapper() {
-        if (mapSpace) {
-            VirtualFree(mapSpace, loader.getNtHeader()->OptionalHeader.SizeOfImage, MEM_FREE);
+        if (imageSpace) {
+            VirtualFree(imageSpace, loader.getNtHeader()->OptionalHeader.SizeOfImage, MEM_FREE);
         }
     }
 
     void fixReLocation(PVOID realBase) {
         PIMAGE_NT_HEADERS ntHeader = loader.getNtHeader();
-        PIMAGE_BASE_RELOCATION relocTable = (PIMAGE_BASE_RELOCATION)(mapSpace + ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
+        PIMAGE_BASE_RELOCATION relocTable = (PIMAGE_BASE_RELOCATION)(imageSpace + ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress);
 
         int64_t delta = (int64_t)realBase - ntHeader->OptionalHeader.ImageBase;
 
@@ -1112,7 +1112,7 @@ public:
                 WORD offset = relocElems[i] & 0xFFF;
 
                 // 目标地址
-                PVOID targetAddr = mapSpace + pageAddr + offset;
+                PVOID targetAddr = imageSpace + pageAddr + offset;
 
                 // 分类处理
                 if (type == IMAGE_REL_BASED_ABSOLUTE) {
@@ -1145,7 +1145,7 @@ public:
 
     void fixImport(const RemoteProcess& proc) {
         PIMAGE_NT_HEADERS ntHeader = loader.getNtHeader();
-        PIMAGE_IMPORT_DESCRIPTOR importTable = (PIMAGE_IMPORT_DESCRIPTOR)(mapSpace + ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+        PIMAGE_IMPORT_DESCRIPTOR importTable = (PIMAGE_IMPORT_DESCRIPTOR)(imageSpace + ntHeader->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
 
         // 记录已加载过的dll
         std::map<std::string, MODULEENTRY32W, CompareStringIgnoreCase> loadedDll;
@@ -1157,7 +1157,7 @@ public:
 
         for (; importTable->Name; importTable++) {
             // 获取DLL名称
-            std::string dllName = (const char*)(mapSpace + importTable->Name);
+            std::string dllName = (const char*)(imageSpace + importTable->Name);
 
             // 解析到实际DLL名称
             std::string originDllName = dllName;
@@ -1181,8 +1181,8 @@ public:
             RemoteModule remoteModule(proc, hRemoteModule, dllName);
 
             // 获取INT(Import Name Table)和IAT(Import Address Table)
-            PIMAGE_THUNK_DATA originalThunk = (PIMAGE_THUNK_DATA)(mapSpace + importTable->OriginalFirstThunk);
-            PIMAGE_THUNK_DATA firstThunk = (PIMAGE_THUNK_DATA)(mapSpace + importTable->FirstThunk);
+            PIMAGE_THUNK_DATA originalThunk = (PIMAGE_THUNK_DATA)(imageSpace + importTable->OriginalFirstThunk);
+            PIMAGE_THUNK_DATA firstThunk = (PIMAGE_THUNK_DATA)(imageSpace + importTable->FirstThunk);
 
             // 如果OriginalFirstThunk为0，回退到FirstThunk
             if (!importTable->OriginalFirstThunk) {
@@ -1200,7 +1200,7 @@ public:
                     Log::Debug(std::format("Import: {} -> {:#x}", ordinal, (uint64_t)funcAddr));
                 } else {
                     // 按名称导入
-                    PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)(mapSpace + originalThunk->u1.AddressOfData);
+                    PIMAGE_IMPORT_BY_NAME importByName = (PIMAGE_IMPORT_BY_NAME)(imageSpace + originalThunk->u1.AddressOfData);
                     funcAddr = remoteModule.getProcAddress(importByName->Name);
 
                     Log::Debug(std::format("Import: {} -> {:#x}", importByName->Name, (uint64_t)funcAddr));
@@ -1226,16 +1226,16 @@ public:
         }
         
         // 分配空间
-        mapSpace = (PBYTE)VirtualAlloc(nullptr, ntHeader->OptionalHeader.SizeOfImage, MEM_COMMIT, PAGE_READWRITE);
+        imageSpace = (PBYTE)VirtualAlloc(nullptr, ntHeader->OptionalHeader.SizeOfImage, MEM_COMMIT, PAGE_READWRITE);
         
         // 映射头
-        loader.read(mapSpace, ntHeader->OptionalHeader.SizeOfHeaders, 0);
+        loader.read(imageSpace, ntHeader->OptionalHeader.SizeOfHeaders, 0);
 
         // 展开节
         std::vector<IMAGE_SECTION_HEADER> sectionTable = loader.getSectionTable();
         for (auto& section: sectionTable) {
             // 目标地址
-            void* dst = mapSpace + section.VirtualAddress;
+            void* dst = imageSpace + section.VirtualAddress;
 
             // 复制大小
             size_t numberOfBytes = _min(section.SizeOfRawData, section.Misc.VirtualSize);
@@ -1249,7 +1249,10 @@ public:
         mapped = true;
     }
 
-    BOOL injectInto(const RemoteProcess& process, InjectMethod method = InjectMethod::HijackThread, bool guiOnly = true) {
+    BOOL injectInto(const RemoteProcess& process, 
+                    InjectMethod method = InjectMethod::HijackThread, 
+                    bool guiOnly = true,
+                    bool hideHeader = false) {
         if (!mapped) {
             buildMemoryImage();
         }
@@ -1266,8 +1269,14 @@ public:
         // 修复重定位
         fixReLocation(remoteImageBase);
 
+        // 抹除PE头
+        if (hideHeader) {
+            memset(imageSpace, 0, ntHeader->OptionalHeader.SizeOfHeaders);
+            PEMapper::Log::Info("Remove the image header in memory.");
+        }
+
         // 复制完整镜像
-        process.writeMemory(remoteImageBase, mapSpace, ntHeader->OptionalHeader.SizeOfImage);
+        process.writeMemory(remoteImageBase, imageSpace, ntHeader->OptionalHeader.SizeOfImage);
         Log::Info(std::format("Write image into remote process[{:#x}]", (uint64_t)remoteImageBase));
 
         // 设置节保护
@@ -1309,8 +1318,10 @@ public:
                                                                     .toBytes();
                                                                 
             // 写入Stub Shellcode
-            PVOID remoteStub = process.alloc(stub.size(), PAGE_EXECUTE_READWRITE);
-            process.writeMemory(remoteStub, stub.data(), stub.size());
+            uint64_t stubSize = stub.size();
+            PVOID remoteStub = process.alloc(stubSize, PAGE_READWRITE);
+            process.writeMemory(remoteStub, stub.data(), stubSize);
+            process.setProtect(remoteStub, stubSize, PAGE_EXECUTE_READ);
             
             // 注入APC
             process.queueAPCRun(remoteStub, nullptr, guiOnly);
@@ -1328,8 +1339,10 @@ public:
                                                                     .toBytes();
                                                                 
             // 写入Stub Shellcode
-            PVOID remoteStub = process.alloc(stub.size(), PAGE_EXECUTE_READWRITE);
-            process.writeMemory(remoteStub, stub.data(), stub.size());
+            uint64_t stubSize = stub.size();
+            PVOID remoteStub = process.alloc(stubSize, PAGE_READWRITE);
+            process.writeMemory(remoteStub, stub.data(), stubSize);
+            process.setProtect(remoteStub, stubSize, PAGE_EXECUTE_READ);
 
             // 创建远程线程并等待
             HANDLE hThread = process.createThread(remoteStub);
@@ -1337,7 +1350,7 @@ public:
             WaitForSingleObject(hThread, INFINITE);
 
             // 清理
-            process.free(remoteStub, stub.size());
+            process.free(remoteStub, stubSize);
         } else {
             return FALSE;
         }

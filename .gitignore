@@ -2,3 +2,6 @@
 build/
 
 *.exe
+*.dll
+
+tst_*

@@ -8,6 +8,7 @@ int main(int argc, char const *argv[]) {
     std::string processImageFileName;
     DWORD processId = 0;
     bool guiOnly = true;
+    bool hideHeader = false;
 
     if (argc < 3) {
         PEMapper::Log::Error("Invalid arguments.");
@@ -34,6 +35,8 @@ int main(int argc, char const *argv[]) {
         } else if (!strcmp(argv[i], "-nogui")) {
             guiOnly = false;
             PEMapper::Log::Info("Target process have not GUI, inject all thread.");
+        } else if (!strcmp(argv[i], "--hide-header")) {
+            hideHeader = true;
         }
     }
 
@@ -49,7 +52,7 @@ int main(int argc, char const *argv[]) {
     
     if (processId != 0) {
         // 已指定ProcessID优先使用pid
-        mapper.injectInto(PEMapper::RemoteProcess(processId), method, guiOnly);
+        mapper.injectInto(PEMapper::RemoteProcess(processId), method, guiOnly, hideHeader);
     } else {
         if (dllPath.length() == 0) {
             // 未指定DLL路径
@@ -75,7 +78,7 @@ int main(int argc, char const *argv[]) {
         if (Process32FirstW(hAllProcess, &pe)) {
             do {
                 if (!_wcsicmp(imageFileNameW.c_str(), pe.szExeFile)) {
-                    mapper.injectInto(PEMapper::RemoteProcess(pe.th32ProcessID), method, guiOnly);
+                    mapper.injectInto(PEMapper::RemoteProcess(pe.th32ProcessID), method, guiOnly, hideHeader);
                 }
             } while (Process32NextW(hAllProcess, &pe));
         }
